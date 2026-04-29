@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { AgentClient, UserClient, PrivateKeySigner, EventType, DeliverableType } from '@croo-network/sdk';
+import { AgentClient, EventType, DeliverableType } from '@croo-network/sdk';
 import { research } from './research.js';
 
 const app = express();
@@ -19,48 +19,52 @@ const PROVIDER_SDK_KEY = 'croo_sk_0f60cb24b03c2d764be09fc0d880b6f0';
 const REQUESTER_SDK_KEY = 'croo_sk_bbc6cc1f0c4ab9623a6f5db4369ff5fe';
 const SERVICE_ID = 'f8368a2b-7e32-43ca-a298-fbfc94346ec0';
 
-// Track active orders
-const pendingOrders = new Map();
+// Track orders by negotiation ID and order ID
+const ordersByNegId = new Map(); // negotiationId -> orderData
+const ordersByOrdId = new Map(); // orderId -> orderData
 
-// ─── START PROVIDER LISTENER ON BOOT ───
+// ─── PROVIDER LISTENER ───
 async function startProvider() {
   console.log('Starting provider agent...');
   const provider = new AgentClient(config, PROVIDER_SDK_KEY);
 
-  let providerStream;
-
   async function connect() {
     try {
-      providerStream = await provider.connectWebSocket();
-      console.log('✅ Provider agent online and listening for orders');
+      const stream = await provider.connectWebSocket();
+      console.log('✅ Provider agent online and listening');
 
-      providerStream.on(EventType.NegotiationCreated, async (e) => {
+      stream.on(EventType.NegotiationCreated, async (e) => {
         console.log('📨 Negotiation received:', e.negotiation_id);
         try {
           const result = await provider.acceptNegotiation(e.negotiation_id);
           const orderId = result.order.orderId;
-          console.log('✅ Negotiation accepted, order:', orderId);
+          console.log('✅ Accepted, order:', orderId);
 
-          // Store negotiation → order mapping
-          if (pendingOrders.has(e.negotiation_id)) {
-            const pending = pendingOrders.get(e.negotiation_id);
-            pending.orderId = orderId;
-            pendingOrders.set(orderId, pending);
+          // Link negotiation to order
+          const data = ordersByNegId.get(e.negotiation_id);
+          if (data) {
+            data.orderId = orderId;
+            ordersByOrdId.set(orderId, data);
+            console.log('🔗 Linked neg', e.negotiation_id, '→ order', orderId);
+          } else {
+            // Create entry even if requester hasn't registered yet
+            const newData = { orderId, negotiationId: e.negotiation_id };
+            ordersByOrdId.set(orderId, newData);
+            ordersByNegId.set(e.negotiation_id, newData);
           }
         } catch (err) {
           console.error('Accept error:', err.message);
         }
       });
 
-      providerStream.on(EventType.OrderPaid, async (e) => {
-        console.log('💰 Payment received for order:', e.order_id);
+      stream.on(EventType.OrderPaid, async (e) => {
+        console.log('💰 Payment confirmed for order:', e.order_id);
         try {
-          const pending = pendingOrders.get(e.order_id);
-          const topic = pending?.query || 'General DeFi market analysis';
+          const data = ordersByOrdId.get(e.order_id);
+          const topic = data?.query || 'General DeFi market analysis 2026';
+          console.log('🔬 Researching:', topic);
 
-          console.log('🔬 Researching topic:', topic);
           const report = await research(topic);
-
           const delivery = await provider.deliverOrder(e.order_id, {
             deliverableType: DeliverableType.Text,
             deliverableText: report,
@@ -68,32 +72,39 @@ async function startProvider() {
 
           console.log('📦 Delivered! TX:', delivery.txHash);
 
-          if (pending) {
-            pending.deliveryTx = delivery.txHash;
-            pending.report = report;
+          if (data) {
+            data.deliveryTx = delivery.txHash;
+            data.report = report;
           }
         } catch (err) {
           console.error('Deliver error:', err.message);
         }
       });
 
-      providerStream.on(EventType.OrderCompleted, (e) => {
+      stream.on(EventType.OrderCompleted, (e) => {
         console.log('🎉 Order completed:', e.order_id);
-        const pending = pendingOrders.get(e.order_id);
-        if (pending?.resolve) {
-          pending.resolve({
+        const data = ordersByOrdId.get(e.order_id);
+        if (data?.resolve) {
+          data.resolve({
             orderId: e.order_id,
-            paymentTx: pending.paymentTx,
-            deliveryTx: pending.deliveryTx,
-            report: pending.report,
+            paymentTx: data.paymentTx || '',
+            deliveryTx: data.deliveryTx || '',
+            report: data.report || '',
+            network: 'Base Mainnet',
+            agentId: '1b301682-55f4-4ca2-8fb6-deff838ab9fe',
+            serviceId: SERVICE_ID,
           });
         }
-        pendingOrders.delete(e.order_id);
+        ordersByOrdId.delete(e.order_id);
+      });
+
+      stream.on('close', () => {
+        console.log('Provider stream closed, reconnecting in 5s...');
+        setTimeout(connect, 5000);
       });
 
     } catch (err) {
       console.error('Provider connection error:', err.message);
-      console.log('Retrying in 5s...');
       setTimeout(connect, 5000);
     }
   }
@@ -111,7 +122,7 @@ app.post('/analyze', async (req, res) => {
   const { query, type } = req.body;
   if (!query) return res.status(400).json({ error: 'query required' });
 
-  console.log('New analysis request:', query);
+  console.log('📥 New query:', query);
 
   try {
     const requester = new AgentClient(config, REQUESTER_SDK_KEY);
@@ -126,18 +137,29 @@ app.post('/analyze', async (req, res) => {
       let orderId = '';
       let paymentTx = '';
 
-      // Requester: pay when order is created
+      // Requester listens for order created then pays
       requesterStream.on(EventType.OrderCreated, async (e) => {
         orderId = e.order_id;
-        console.log('📋 Order created, paying:', orderId);
+        console.log('📋 Requester sees order created:', orderId);
+
+        // Make sure this order is in our map
+        const existing = ordersByOrdId.get(orderId) || ordersByNegId.get(e.negotiation_id);
+        if (existing) {
+          existing.orderId = orderId;
+          existing.resolve = resolve;
+          existing.reject = reject;
+          existing.query = query;
+          ordersByOrdId.set(orderId, existing);
+        }
+
         try {
+          console.log('💳 Paying order:', orderId);
           const payment = await requester.payOrder(orderId);
           paymentTx = payment.txHash;
-          console.log('💳 Payment TX:', paymentTx);
+          console.log('✅ Payment TX:', paymentTx);
 
-          // Update pending order with payment info
-          const pending = pendingOrders.get(orderId);
-          if (pending) pending.paymentTx = paymentTx;
+          const data = ordersByOrdId.get(orderId);
+          if (data) data.paymentTx = paymentTx;
         } catch (err) {
           clearTimeout(timeout);
           requesterStream.close();
@@ -145,21 +167,21 @@ app.post('/analyze', async (req, res) => {
         }
       });
 
-      // Requester: order completed
+      // Requester listens for completion
       requesterStream.on(EventType.OrderCompleted, async (e) => {
-        if (e.order_id !== orderId) return;
+        if (orderId && e.order_id !== orderId) return;
         clearTimeout(timeout);
         requesterStream.close();
+        console.log('✅ Requester sees order completed:', e.order_id);
 
-        // Get delivery details
         try {
-          const delivery = await requester.getDelivery(orderId);
-          const pending = pendingOrders.get(orderId);
+          const delivery = await requester.getDelivery(e.order_id);
+          const data = ordersByOrdId.get(e.order_id);
           resolve({
-            orderId,
-            paymentTx,
-            deliveryTx: pending?.deliveryTx || '',
-            report: delivery.deliverableText || pending?.report || '',
+            orderId: e.order_id,
+            paymentTx: paymentTx,
+            deliveryTx: data?.deliveryTx || '',
+            report: delivery.deliverableText || data?.report || '',
             network: 'Base Mainnet',
             agentId: '1b301682-55f4-4ca2-8fb6-deff838ab9fe',
             serviceId: SERVICE_ID,
@@ -169,21 +191,29 @@ app.post('/analyze', async (req, res) => {
         }
       });
 
-      // Place the negotiation
+      // Place the negotiation AFTER listeners are set up
+      console.log('🤝 Placing negotiation...');
       const neg = await requester.negotiateOrder({
         serviceId: SERVICE_ID,
         requirements: JSON.stringify({ topic: query, type: type || 'RESEARCH' }),
       });
 
-      console.log('🤝 Negotiation started:', neg.negotiationId);
+      console.log('📝 Negotiation ID:', neg.negotiationId);
 
-      // Register in pending orders so provider can find it
-      pendingOrders.set(neg.negotiationId, {
+      // Register in maps so provider can find it
+      const orderData = {
         negotiationId: neg.negotiationId,
         query,
         resolve,
         reject,
-      });
+      };
+      ordersByNegId.set(neg.negotiationId, orderData);
+
+      // If provider already accepted before we registered, link it now
+      const existing = ordersByNegId.get(neg.negotiationId);
+      if (existing?.orderId) {
+        ordersByOrdId.set(existing.orderId, orderData);
+      }
     });
 
     res.json(result);
@@ -197,5 +227,5 @@ app.post('/analyze', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`ZERU backend running on port ${PORT}`);
-  await startProvider(); // Start provider listener immediately
+  await startProvider();
 });
