@@ -19,8 +19,9 @@ const PROVIDER_SDK_KEY = process.env.CROO_SDK_KEY || 'croo_sk_0f60cb24b03c2d764b
 const REQUESTER_SDK_KEY = 'croo_sk_bbc6cc1f0c4ab9623a6f5db4369ff5fe';
 const STORE_SDK_KEY = process.env.CROO_STORE_SDK_KEY;
 const SERVICE_ID = 'f8368a2b-7e32-43ca-a298-fbfc94346ec0';
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL || 'https://zeru-agent.onrender.com';
 
-// Health check
+// ─── HEALTH CHECK ───
 app.get('/', (req, res) => {
   res.json({
     status: 'ZERU agent online',
@@ -28,10 +29,11 @@ app.get('/', (req, res) => {
     protocol: 'CROO v1',
     marketplace: 'agent.croo.network',
     agentId: '1b301682-55f4-4ca2-8fb6-deff838ab9fe',
+    uptime: process.uptime(),
   });
 });
 
-// Manual query endpoint (from UI)
+// ─── MANUAL QUERY ENDPOINT (from UI) ───
 app.post('/analyze', async (req, res) => {
   const { query, type } = req.body;
   if (!query) return res.status(400).json({ error: 'query required' });
@@ -58,7 +60,7 @@ app.post('/analyze', async (req, res) => {
   }
 });
 
-// Full order cycle handler
+// ─── FULL ORDER CYCLE ───
 async function runFullOrderCycle(providerKey, requesterKey, negotiationId, query) {
   return new Promise(async (resolve, reject) => {
     const provider = new AgentClient(config, providerKey);
@@ -124,60 +126,90 @@ async function runFullOrderCycle(providerKey, requesterKey, negotiationId, query
   });
 }
 
-// Agent Store provider listener — handles orders from agent.croo.network
+// ─── AGENT STORE PROVIDER LISTENER ───
+let storeStream = null;
+let reconnectAttempts = 0;
+
 async function startStoreProvider() {
   if (!STORE_SDK_KEY) {
     console.log('No CROO_STORE_SDK_KEY set — skipping Agent Store listener');
     return;
   }
 
-  console.log('Starting Agent Store provider listener...');
-  const storeProvider = new AgentClient(config, STORE_SDK_KEY);
-  const stream = await storeProvider.connectWebSocket();
-  console.log('✅ Agent Store WebSocket connected');
+  try {
+    console.log(`Starting Agent Store provider listener... (attempt ${reconnectAttempts + 1})`);
+    const storeProvider = new AgentClient(config, STORE_SDK_KEY);
+    storeStream = await storeProvider.connectWebSocket();
+    reconnectAttempts = 0;
+    console.log('✅ Agent Store WebSocket connected');
 
-  stream.on(EventType.NegotiationCreated, async (e) => {
-    console.log('📨 Agent Store negotiation received:', e.negotiation_id);
-    try {
-      const result = await storeProvider.acceptNegotiation(e.negotiation_id);
-      console.log('✅ Accepted, order:', result.order.orderId);
-    } catch (err) {
-      console.error('Accept error:', err.message);
-    }
-  });
+    storeStream.on(EventType.NegotiationCreated, async (e) => {
+      console.log('📨 Agent Store negotiation received:', e.negotiation_id);
+      try {
+        const result = await storeProvider.acceptNegotiation(e.negotiation_id);
+        console.log('✅ Accepted, order:', result.order.orderId);
+      } catch (err) {
+        console.error('Accept error:', err.message);
+      }
+    });
 
-  stream.on(EventType.OrderPaid, async (e) => {
-    console.log('💰 Agent Store payment received:', e.order_id);
-    try {
-      const order = await storeProvider.getOrder(e.order_id);
-      const requirements = JSON.parse(order.requirement || '{}');
-      const topic = requirements.topic || requirements.text || requirements.task || order.requirement || 'DeFi market analysis';
+    storeStream.on(EventType.OrderPaid, async (e) => {
+      console.log('💰 Agent Store payment received:', e.order_id);
+      try {
+        const order = await storeProvider.getOrder(e.order_id);
+        const requirements = JSON.parse(order.requirement || '{}');
+        const topic = requirements.topic || requirements.text || requirements.task || order.requirement || 'DeFi market analysis';
 
-      console.log('🔬 Researching topic:', topic);
-      const report = await research(topic);
+        console.log('🔬 Researching topic:', topic);
+        const report = await research(topic);
 
-      const delivery = await storeProvider.deliverOrder(e.order_id, {
-        deliverableType: DeliverableType.Text,
-        deliverableText: report,
-      });
+        const delivery = await storeProvider.deliverOrder(e.order_id, {
+          deliverableType: DeliverableType.Text,
+          deliverableText: report,
+        });
 
-      console.log('📦 Delivered to Agent Store buyer:', delivery.txHash);
-    } catch (err) {
-      console.error('Delivery error:', err.message);
-    }
-  });
+        console.log('📦 Delivered to Agent Store buyer:', delivery.txHash);
+      } catch (err) {
+        console.error('Delivery error:', err.message);
+      }
+    });
 
-  stream.on(EventType.OrderCompleted, (e) => {
-    console.log('🎉 Agent Store order settled:', e.order_id);
-  });
+    storeStream.on(EventType.OrderCompleted, (e) => {
+      console.log('🎉 Agent Store order settled:', e.order_id);
+    });
 
-  // Reconnect on disconnect
-  stream.on('close', async () => {
-    console.log('Agent Store WebSocket closed — reconnecting in 5s...');
-    setTimeout(startStoreProvider, 5000);
-  });
+    // Auto-reconnect on disconnect with exponential backoff
+    storeStream.on('close', async () => {
+      reconnectAttempts++;
+      const delay = Math.min(5000 * reconnectAttempts, 30000);
+      console.log(`Agent Store WebSocket closed — reconnecting in ${delay/1000}s... (attempt ${reconnectAttempts})`);
+      setTimeout(startStoreProvider, delay);
+    });
+
+    storeStream.on('error', (err) => {
+      console.error('Agent Store WebSocket error:', err.message);
+    });
+
+  } catch (err) {
+    reconnectAttempts++;
+    const delay = Math.min(5000 * reconnectAttempts, 30000);
+    console.error(`Agent Store connection failed: ${err.message} — retrying in ${delay/1000}s`);
+    setTimeout(startStoreProvider, delay);
+  }
 }
 
+// ─── KEEP-ALIVE PING ───
+// Prevents Render free tier from spinning down (pings every 14 minutes)
+setInterval(async () => {
+  try {
+    await fetch(RENDER_URL);
+    console.log('✅ Keep-alive ping sent');
+  } catch (e) {
+    console.log('Keep-alive failed:', e.message);
+  }
+}, 14 * 60 * 1000);
+
+// ─── START SERVER ───
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ ZERU backend running on port ${PORT}`);
