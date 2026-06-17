@@ -86,11 +86,20 @@ function parseResearchReport(report, projectName) {
   }
   const summary = summaryLines.join(' ').substring(0, 500) || null;
 
-  // Extract risks — lines containing risk keywords
+  // Extract risks — lines that look like actual risk items (contain % or start with a risk pattern)
   const riskKeywords = ['risk', 'concern', 'warning', 'hack', 'exploit', 'vulnerability',
-                        'fraud', 'scam', 'regulatory', 'lawsuit', 'SEC', 'CFTC', 'centrali'];
+                        'fraud', 'scam', 'regulatory', 'lawsuit', 'SEC', 'CFTC', 'centrali',
+                        'concentration', 'exposure', 'attack', 'failure'];
   const risks = lines
-    .filter(l => riskKeywords.some(k => l.toLowerCase().includes(k)) && l.length > 20)
+    .filter(l => {
+      const lower = l.toLowerCase();
+      const hasRiskWord = riskKeywords.some(k => lower.includes(k));
+      const hasPercent  = l.includes('%');
+      const isDash      = l.startsWith('-') || l.startsWith('•') || l.startsWith('*');
+      const longEnough  = l.length > 20 && l.length < 400;
+      // Must have a risk word AND (percentage or bullet) to avoid pulling in the summary
+      return longEnough && hasRiskWord && (hasPercent || isDash || l.match(/^\w.*risk|^\w.*concern/i));
+    })
     .slice(0, 5)
     .map(l => l.replace(/^[-•*]\s*/, '').trim());
 
